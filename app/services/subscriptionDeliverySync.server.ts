@@ -238,12 +238,19 @@ export const processSubscriptionDeliverySyncWebhook = async ({
   });
 
   if (!isRecurringSubscriptionOrder) {
+    const hint = isFirstSubscriptionOrder
+      ? "Pierwsze zamówienie subskrypcji — aplikacja celowo nic nie zmienia (punkt odniesienia dla kolejnych odnowień)."
+      : "Tag appstle_subscription_recurring_order może pojawić się dopiero przy orders/updated.";
+
     appLog.info("sync:skip — to nie jest zamówienie cykliczne Appstle", {
       ...baseContext,
-      reason: "NOT_RECURRING_ORDER",
+      reason: isFirstSubscriptionOrder
+        ? "FIRST_SUBSCRIPTION_ORDER_ONLY"
+        : "NOT_RECURRING_ORDER",
       orderId,
       orderTags,
-      hint: "Tag appstle_subscription_recurring_order może pojawić się dopiero przy orders/updated.",
+      isFirstSubscriptionOrder,
+      hint,
     });
     return;
   }

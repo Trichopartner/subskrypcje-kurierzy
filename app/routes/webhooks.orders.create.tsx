@@ -11,6 +11,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const runId = createWebhookRunId();
   const startedAt = Date.now();
 
+  // Log PRZED authenticate — widać nawet gdy HMAC/DB się wyłoży
+  appLog.info("webhook:orders/create:hit", {
+    runId,
+    path: new URL(request.url).pathname,
+    shopifyTopic: request.headers.get("x-shopify-topic"),
+    shopifyShop: request.headers.get("x-shopify-shop-domain"),
+    deployedAppUrl: process.env.SHOPIFY_APP_URL ?? null,
+  });
+
   appLog.info("webhook:orders/create:received", {
     runId,
     method: request.method,
