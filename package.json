@@ -2,6 +2,7 @@
   "name": "proteoglikany-dostawa",
   "private": true,
   "scripts": {
+    "postinstall": "prisma generate",
     "build": "pnpm run setup && react-router build",
     "dev": "shopify app dev",
     "config:link": "shopify app config link",
