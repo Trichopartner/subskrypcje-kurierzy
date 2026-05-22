@@ -1,3 +1,10 @@
+import {
+  appLog,
+  createWebhookRunId,
+  sanitizeOrderWebhookPayload,
+  type AppLogContext,
+} from "../utils/appLogger.server";
+
 type AdminGraphqlClient = {
   graphql: (
     query: string,
@@ -12,6 +19,7 @@ type ProcessWebhookInput = {
   payload: unknown;
   topic: string;
   shop: string;
+  runId?: string;
 };
 
 const APPSTLE_FIRST_ORDER_TAG = "appstle_subscription_first_order";
@@ -28,18 +36,34 @@ const parseOrderTags = (rawTags: string | undefined): string[] =>
 
 const PICKUP_POINT_ATTRIBUTE_KEY_PATTERN = /^pickuppoint/i;
 
-const getPointIdFromShippingCode = (shippingCode: string | null | undefined): string | null => {
+const getPointIdFromShippingCode = (
+  shippingCode: string | null | undefined,
+  logContext?: { source: string },
+): string | null => {
   if (!shippingCode) {
+    appLog.debug("getPointIdFromShippingCode: brak kodu wysyłki", logContext);
     return null;
   }
 
   try {
     const parsed = JSON.parse(shippingCode) as { pointId?: string };
     if (parsed.pointId?.trim()) {
+      appLog.debug("getPointIdFromShippingCode: pointId z JSON", {
+        ...logContext,
+        pointId: parsed.pointId.trim(),
+        shippingCodePreview: shippingCode.slice(0, 200),
+      });
       return parsed.pointId.trim();
     }
+    appLog.debug("getPointIdFromShippingCode: JSON bez pointId", {
+      ...logContext,
+      shippingCodePreview: shippingCode.slice(0, 200),
+    });
   } catch {
-    // non-JSON shipping code
+    appLog.debug("getPointIdFromShippingCode: kod nie jest JSON", {
+      ...logContext,
+      shippingCodePreview: shippingCode.slice(0, 200),
+    });
   }
 
   return null;
@@ -47,8 +71,10 @@ const getPointIdFromShippingCode = (shippingCode: string | null | undefined): st
 
 const getPointIdFromCustomAttributes = (
   customAttributes: Array<{ key: string; value?: string | null }> | undefined,
+  logContext?: { source: string },
 ): string | null => {
   if (!customAttributes?.length) {
+    appLog.debug("getPointIdFromCustomAttributes: brak atrybutów", logContext);
     return null;
   }
 
@@ -57,8 +83,17 @@ const getPointIdFromCustomAttributes = (
   );
 
   if (!pointIdAttribute?.value?.trim()) {
+    appLog.debug("getPointIdFromCustomAttributes: brak pickuppointid", {
+      ...logContext,
+      attributeKeys: customAttributes.map((a) => a.key),
+    });
     return null;
   }
+
+  appLog.debug("getPointIdFromCustomAttributes: znaleziono pickuppointid", {
+    ...logContext,
+    pointId: pointIdAttribute.value.trim(),
+  });
 
   return pointIdAttribute.value.trim();
 };
@@ -127,22 +162,58 @@ const areAttributesEquivalent = (
   return true;
 };
 
+const diffAttributes = (
+  before: Array<{ key: string; value: string }>,
+  after: Array<{ key: string; value: string }>,
+): AppLogContext => {
+  const beforeMap = toAttributesMap(before);
+  const afterMap = toAttributesMap(after);
+  const changed: Array<{ key: string; from: string | null; to: string | null }> = [];
+
+  const allKeys = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  for (const key of allKeys) {
+    const from = beforeMap.get(key) ?? null;
+    const to = afterMap.get(key) ?? null;
+    if (from !== to) {
+      changed.push({ key, from, to });
+    }
+  }
+
+  return { changedCount: changed.length, changed };
+};
+
 export const processSubscriptionDeliverySyncWebhook = async ({
   admin,
   payload,
   topic,
   shop,
+  runId: externalRunId,
 }: ProcessWebhookInput): Promise<void> => {
-  console.log(`Received ${topic} webhook for ${shop}`);
+  const runId = externalRunId ?? createWebhookRunId();
+  const baseContext = { runId, topic, shop };
+
+  appLog.info("sync:start", {
+    ...baseContext,
+    hasAdmin: Boolean(admin),
+    payloadSummary: sanitizeOrderWebhookPayload(payload),
+  });
 
   if (!admin) {
-    console.warn("Skipping order webhook because no admin client is available.");
+    appLog.warn("sync:skip — brak klienta Admin API (np. webhook z CLI)", {
+      ...baseContext,
+      reason: "NO_ADMIN_CLIENT",
+      hint: "Webhook musi pochodzić ze sklepu z zainstalowaną aplikacją.",
+    });
     return;
   }
 
   const orderNumericId = (payload as { id?: number }).id;
   if (!orderNumericId) {
-    console.warn("Order webhook payload has no numeric id", { payload });
+    appLog.warn("sync:skip — brak id w payloadzie", {
+      ...baseContext,
+      reason: "NO_ORDER_ID",
+      payloadSummary: sanitizeOrderWebhookPayload(payload),
+    });
     return;
   }
 
@@ -154,24 +225,36 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     APPSTLE_RECURRING_ORDER_TAG,
   );
 
-  console.log("Order webhook tags parsed", {
-    topic,
+  appLog.info("sync:tags", {
+    ...baseContext,
     orderId,
+    orderNumericId,
+    rawTags: rawTags ?? null,
     orderTags,
     isFirstSubscriptionOrder,
     isRecurringSubscriptionOrder,
+    expectedRecurringTag: APPSTLE_RECURRING_ORDER_TAG,
+    expectedFirstTag: APPSTLE_FIRST_ORDER_TAG,
   });
 
   if (!isRecurringSubscriptionOrder) {
-    console.log("Skipping order - not Appstle recurring subscription order", {
-      topic,
+    appLog.info("sync:skip — to nie jest zamówienie cykliczne Appstle", {
+      ...baseContext,
+      reason: "NOT_RECURRING_ORDER",
       orderId,
+      orderTags,
+      hint: "Tag appstle_subscription_recurring_order może pojawić się dopiero przy orders/updated.",
     });
     return;
   }
 
-  console.log("Order webhook payload parsed", { topic, orderId, orderNumericId });
+  appLog.info("sync:recurring-order-detected", {
+    ...baseContext,
+    orderId,
+    orderNumericId,
+  });
 
+  const currentOrderQueryStartedAt = Date.now();
   const currentOrderResponse = await admin.graphql(
     `#graphql
       query CurrentOrderShipping($orderId: ID!) {
@@ -206,29 +289,59 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     errors?: Array<{ message: string }>;
   };
 
+  appLog.info("sync:graphql-current-order", {
+    ...baseContext,
+    orderId,
+    durationMs: Date.now() - currentOrderQueryStartedAt,
+    httpStatus: currentOrderResponse.status,
+    hasOrder: Boolean(currentOrderData.data?.order),
+    graphqlErrors: currentOrderData.errors ?? [],
+    orderName: currentOrderData.data?.order?.name ?? null,
+    shippingLine: currentOrderData.data?.order?.shippingLine ?? null,
+    customAttributes: currentOrderData.data?.order?.customAttributes ?? [],
+  });
+
   if (currentOrderData.errors?.length) {
-    console.error("Current order query failed:", {
-      topic,
-      errors: currentOrderData.errors,
+    appLog.error("sync:abort — błąd zapytania o bieżące zamówienie", {
+      ...baseContext,
+      reason: "CURRENT_ORDER_QUERY_FAILED",
+      orderId,
+      graphqlErrors: currentOrderData.errors,
     });
     return;
   }
 
   const currentOrder = currentOrderData.data?.order;
   if (!currentOrder) {
-    console.warn("Current order not found via Admin API", { topic, orderId });
-    return;
-  }
-
-  const customerNumericId = (payload as { customer?: { id?: number } }).customer?.id;
-  if (!customerNumericId) {
-    console.warn("Recurring order has no customer id in payload", {
-      topic,
+    appLog.warn("sync:abort — zamówienie nie znalezione w Admin API", {
+      ...baseContext,
+      reason: "CURRENT_ORDER_NOT_FOUND",
       orderId,
     });
     return;
   }
 
+  const customerNumericId = (payload as { customer?: { id?: number } }).customer?.id;
+  if (!customerNumericId) {
+    appLog.warn("sync:abort — brak customer.id w payloadzie webhooka", {
+      ...baseContext,
+      reason: "NO_CUSTOMER_ID_IN_PAYLOAD",
+      orderId,
+      payloadSummary: sanitizeOrderWebhookPayload(payload),
+      hint: "Shopify czasem nie wysyła customer w orders/create — sprawdź orders/updated.",
+    });
+    return;
+  }
+
+  const firstOrderSearchQuery = `customer_id:${customerNumericId} tag:${APPSTLE_FIRST_ORDER_TAG}`;
+  appLog.info("sync:search-first-order", {
+    ...baseContext,
+    orderId,
+    customerNumericId,
+    searchQuery: firstOrderSearchQuery,
+  });
+
+  const firstOrderQueryStartedAt = Date.now();
   const firstOrderByTagResponse = await admin.graphql(
     `#graphql
       query FindFirstSubscriptionOrderByTag($query: String!) {
@@ -250,7 +363,7 @@ export const processSubscriptionDeliverySyncWebhook = async ({
       }`,
     {
       variables: {
-        query: `customer_id:${customerNumericId} tag:${APPSTLE_FIRST_ORDER_TAG}`,
+        query: firstOrderSearchQuery,
       },
     },
   );
@@ -270,11 +383,23 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     errors?: Array<{ message: string }>;
   };
 
+  appLog.info("sync:graphql-first-order", {
+    ...baseContext,
+    orderId,
+    durationMs: Date.now() - firstOrderQueryStartedAt,
+    httpStatus: firstOrderByTagResponse.status,
+    nodesCount: firstOrderByTagData.data?.orders?.nodes?.length ?? 0,
+    graphqlErrors: firstOrderByTagData.errors ?? [],
+    firstOrder: firstOrderByTagData.data?.orders?.nodes?.[0] ?? null,
+  });
+
   if (firstOrderByTagData.errors?.length) {
-    console.error("Could not fetch first Appstle order by tag", {
-      topic,
+    appLog.error("sync:abort — błąd wyszukiwania pierwszego zamówienia", {
+      ...baseContext,
+      reason: "FIRST_ORDER_QUERY_FAILED",
       orderId,
       customerNumericId,
+      searchQuery: firstOrderSearchQuery,
       graphqlErrors: firstOrderByTagData.errors,
     });
     return;
@@ -282,10 +407,12 @@ export const processSubscriptionDeliverySyncWebhook = async ({
 
   const firstTaggedOrder = firstOrderByTagData.data?.orders?.nodes?.[0];
   if (!firstTaggedOrder) {
-    console.warn("No first subscription order found by Appstle tag", {
-      topic,
+    appLog.warn("sync:abort — brak pierwszego zamówienia z tagiem Appstle", {
+      ...baseContext,
+      reason: "FIRST_ORDER_NOT_FOUND",
       orderId,
       customerNumericId,
+      searchQuery: firstOrderSearchQuery,
       expectedTag: APPSTLE_FIRST_ORDER_TAG,
     });
     return;
@@ -296,12 +423,23 @@ export const processSubscriptionDeliverySyncWebhook = async ({
   const recurringTitle = currentOrder.shippingLine?.title ?? null;
   const firstTitle = firstTaggedOrder.shippingLine?.title ?? null;
 
-  const recurringPointId =
-    getPointIdFromCustomAttributes(currentOrder.customAttributes) ??
-    getPointIdFromShippingCode(recurringCode);
-  const firstPointId =
-    getPointIdFromCustomAttributes(firstTaggedOrder.customAttributes) ??
-    getPointIdFromShippingCode(firstCode);
+  const recurringPointFromAttrs = getPointIdFromCustomAttributes(
+    currentOrder.customAttributes,
+    { source: "recurring-customAttributes" },
+  );
+  const recurringPointFromCode = getPointIdFromShippingCode(recurringCode, {
+    source: "recurring-shippingCode",
+  });
+  const firstPointFromAttrs = getPointIdFromCustomAttributes(
+    firstTaggedOrder.customAttributes,
+    { source: "first-customAttributes" },
+  );
+  const firstPointFromCode = getPointIdFromShippingCode(firstCode, {
+    source: "first-shippingCode",
+  });
+
+  const recurringPointId = recurringPointFromAttrs ?? recurringPointFromCode;
+  const firstPointId = firstPointFromAttrs ?? firstPointFromCode;
 
   const isPointIdMatch =
     Boolean(recurringPointId) &&
@@ -314,37 +452,61 @@ export const processSubscriptionDeliverySyncWebhook = async ({
 
   const isDeliveryMatching = isPointIdMatch || isExactSameCode || isExactSameTitle;
 
+  appLog.info("sync:delivery-comparison", {
+    ...baseContext,
+    orderId,
+    recurringOrderName: currentOrder.name,
+    firstOrderId: firstTaggedOrder.id,
+    firstOrderName: firstTaggedOrder.name,
+    recurring: {
+      shippingLine: currentOrder.shippingLine,
+      pointId: recurringPointId,
+      pointFromAttrs: recurringPointFromAttrs,
+      pointFromCode: recurringPointFromCode,
+      customAttributes: currentOrder.customAttributes,
+    },
+    first: {
+      shippingLine: firstTaggedOrder.shippingLine,
+      tags: firstTaggedOrder.tags,
+      pointId: firstPointId,
+      pointFromAttrs: firstPointFromAttrs,
+      pointFromCode: firstPointFromCode,
+      customAttributes: firstTaggedOrder.customAttributes,
+    },
+    matchChecks: {
+      isPointIdMatch,
+      isExactSameTitle,
+      isExactSameCode,
+      isDeliveryMatching,
+    },
+    note: isDeliveryMatching
+      ? "Uznano zgodność — NIE będzie orderUpdate (nawet jeśli tytuł/kod wygląda inaczej dla człowieka)."
+      : "Wykryto rozjazd — przejdę do synchronizacji atrybutów.",
+  });
+
   if (isDeliveryMatching) {
-    console.log("Recurring order delivery matches first subscription order", {
-      topic,
+    appLog.info("sync:done — dostawa już zgodna, bez zmian", {
+      ...baseContext,
+      reason: "DELIVERY_ALREADY_MATCHING",
       orderId,
-      recurringOrderName: currentOrder.name,
-      recurringShipping: currentOrder.shippingLine,
-      firstOrderId: firstTaggedOrder.id,
-      firstOrderName: firstTaggedOrder.name,
-      firstOrderShipping: firstTaggedOrder.shippingLine,
-      recurringPointId,
-      firstPointId,
     });
     return;
   }
 
-  console.warn("Recurring order delivery mismatch vs first subscription order", {
-    topic,
+  appLog.warn("sync:mismatch — rozjazd dostawy vs pierwsze zamówienie", {
+    ...baseContext,
+    reason: "DELIVERY_MISMATCH",
     orderId,
-    recurringOrderName: currentOrder.name,
-    recurringShipping: currentOrder.shippingLine,
-    firstOrderId: firstTaggedOrder.id,
-    firstOrderName: firstTaggedOrder.name,
-    firstOrderShipping: firstTaggedOrder.shippingLine,
     recurringPointId,
     firstPointId,
-    actionRequired:
-      "Mismatch detected. Without Appstle write API, automatic correction is not possible from this app.",
+    limitation:
+      "Aplikacja nie zmienia shippingLine w zamówieniu — tylko customAttributes + notatkę.",
   });
 
   const currentAttributes = normalizeCustomAttributes(currentOrder.customAttributes);
-  const preferredAttributes = normalizeCustomAttributes(firstTaggedOrder.customAttributes);
+  const preferredAttributes = normalizeCustomAttributes(
+    firstTaggedOrder.customAttributes,
+  );
   const mergedAttributes = mergePickupPointAttributes(
     currentAttributes,
     preferredAttributes,
@@ -355,14 +517,28 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     mergedAttributes,
   );
 
+  appLog.info("sync:attributes-merge", {
+    ...baseContext,
+    orderId,
+    currentAttributes,
+    preferredAttributes,
+    mergedAttributes,
+    attributeDiff: diffAttributes(currentAttributes, mergedAttributes),
+    hasAttributeChanges,
+    pickupPointKeysInPreferred: preferredAttributes
+      .filter((a) => PICKUP_POINT_ATTRIBUTE_KEY_PATTERN.test(a.key))
+      .map((a) => a.key),
+  });
+
   if (!hasAttributeChanges) {
-    console.warn("PickupPoint attributes already match preferred values", {
-      topic,
+    appLog.warn("sync:abort — atrybuty już takie same, brak orderUpdate", {
+      ...baseContext,
+      reason: "ATTRIBUTES_ALREADY_EQUIVALENT",
       orderId,
-      currentAttributesCount: currentAttributes.length,
-      preferredAttributesCount: preferredAttributes.length,
       recurringPointId,
       firstPointId,
+      hint:
+        "Shipping line może być inna, ale atrybuty pickuppoint są identyczne — paczkomat w UI może nadal wyglądać źle.",
     });
     return;
   }
@@ -380,8 +556,21 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     .filter(Boolean)
     .join(" ");
 
+  appLog.info("sync:orderUpdate — wysyłam mutację", {
+    ...baseContext,
+    orderId,
+    updateNote,
+    mergedAttributes,
+    mutationInput: {
+      id: orderId,
+      note: updateNote,
+      customAttributes: mergedAttributes,
+    },
+  });
+
   let updateOrderResponse: Response;
   try {
+    const mutationStartedAt = Date.now();
     updateOrderResponse = await admin.graphql(
       `#graphql
         mutation UpdateOrderPickupPoint($input: OrderInput!) {
@@ -410,12 +599,19 @@ export const processSubscriptionDeliverySyncWebhook = async ({
         },
       },
     );
-  } catch (error) {
-    console.error("Failed to call orderUpdate mutation", {
-      topic,
+    appLog.info("sync:orderUpdate — odpowiedź HTTP", {
+      ...baseContext,
       orderId,
-      error,
-      hint: "App needs write_orders scope and reauthorization after scope change.",
+      durationMs: Date.now() - mutationStartedAt,
+      httpStatus: updateOrderResponse.status,
+    });
+  } catch (error) {
+    appLog.error("sync:abort — wyjątek przy orderUpdate", {
+      ...baseContext,
+      reason: "ORDER_UPDATE_EXCEPTION",
+      orderId,
+      error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+      hint: "Wymagany scope write_orders i ponowna autoryzacja aplikacji w sklepie.",
     });
     return;
   }
@@ -436,19 +632,22 @@ export const processSubscriptionDeliverySyncWebhook = async ({
 
   const updateOrderErrors = updateOrderData.data?.orderUpdate?.userErrors ?? [];
   if (updateOrderData.errors?.length || updateOrderErrors.length) {
-    console.error("Failed to update recurring order additional details/note", {
-      topic,
+    appLog.error("sync:abort — orderUpdate zwrócił błędy", {
+      ...baseContext,
+      reason: "ORDER_UPDATE_FAILED",
       orderId,
-      graphqlErrors: updateOrderData.errors,
+      graphqlErrors: updateOrderData.errors ?? [],
       userErrors: updateOrderErrors,
       mergedAttributes,
     });
     return;
   }
 
-  console.log("Recurring order additional details and note updated", {
-    topic,
+  appLog.info("sync:done — zamówienie zaktualizowane", {
+    ...baseContext,
+    reason: "ORDER_UPDATED",
     orderId,
+    updatedOrder: updateOrderData.data?.orderUpdate?.order ?? null,
     updatedAttributeKeys: mergedAttributes.map((attribute) => attribute.key),
     noteUpdated: true,
   });
