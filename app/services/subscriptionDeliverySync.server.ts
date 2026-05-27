@@ -35,6 +35,7 @@ const parseOrderTags = (rawTags: string | undefined): string[] =>
     .filter(Boolean);
 
 const PICKUP_POINT_ATTRIBUTE_KEY_PATTERN = /^pickuppoint/i;
+const PICKUP_POINT_CODE_PATTERN = /\b([A-Z0-9]{5,})\b/g;
 
 const getPointIdFromShippingCode = (
   shippingCode: string | null | undefined,
@@ -67,6 +68,36 @@ const getPointIdFromShippingCode = (
   }
 
   return null;
+};
+
+const getPointIdFromShippingTitle = (
+  shippingTitle: string | null | undefined,
+  logContext?: { source: string },
+): string | null => {
+  if (!shippingTitle?.trim()) {
+    appLog.debug("getPointIdFromShippingTitle: brak tytułu wysyłki", logContext);
+    return null;
+  }
+
+  const normalized = shippingTitle.toUpperCase();
+  const matches = normalized.match(PICKUP_POINT_CODE_PATTERN) ?? [];
+  const selected = matches.find((candidate) => /\d/.test(candidate));
+
+  if (!selected) {
+    appLog.debug("getPointIdFromShippingTitle: brak kandydata pointId w title", {
+      ...logContext,
+      shippingTitle,
+      candidates: matches,
+    });
+    return null;
+  }
+
+  appLog.debug("getPointIdFromShippingTitle: pointId z title", {
+    ...logContext,
+    shippingTitle,
+    pointId: selected,
+  });
+  return selected;
 };
 
 const getPointIdFromCustomAttributes = (
@@ -108,6 +139,46 @@ const normalizeCustomAttributes = (
       value: (attribute.value ?? "").trim(),
     }))
     .filter((attribute) => attribute.value.length > 0);
+
+const upsertAttribute = (
+  attributes: Array<{ key: string; value: string }>,
+  key: string,
+  value: string,
+): Array<{ key: string; value: string }> => {
+  const next = [...attributes];
+  const existingIndex = next.findIndex(
+    (attribute) => attribute.key.toLowerCase() === key.toLowerCase(),
+  );
+
+  if (existingIndex >= 0) {
+    next[existingIndex] = { key: next[existingIndex].key, value };
+    return next;
+  }
+
+  next.push({ key, value });
+  return next;
+};
+
+const enrichPickupPointAttributes = (
+  attributes: Array<{ key: string; value: string }>,
+  fallback: {
+    pointId: string | null;
+    courier: string | null;
+  },
+): Array<{ key: string; value: string }> => {
+  if (!fallback.pointId) {
+    return attributes;
+  }
+
+  let next = upsertAttribute(attributes, "PickupPointId", fallback.pointId);
+  next = upsertAttribute(next, "PickupPointName", fallback.pointId);
+
+  if (fallback.courier) {
+    next = upsertAttribute(next, "PickupPointCourier", fallback.courier);
+  }
+
+  return next;
+};
 
 const mergePickupPointAttributes = (
   currentAttributes: Array<{ key: string; value: string }>,
@@ -437,6 +508,9 @@ export const processSubscriptionDeliverySyncWebhook = async ({
   const recurringPointFromCode = getPointIdFromShippingCode(recurringCode, {
     source: "recurring-shippingCode",
   });
+  const recurringPointFromTitle = getPointIdFromShippingTitle(recurringTitle, {
+    source: "recurring-shippingTitle",
+  });
   const firstPointFromAttrs = getPointIdFromCustomAttributes(
     firstTaggedOrder.customAttributes,
     { source: "first-customAttributes" },
@@ -444,9 +518,13 @@ export const processSubscriptionDeliverySyncWebhook = async ({
   const firstPointFromCode = getPointIdFromShippingCode(firstCode, {
     source: "first-shippingCode",
   });
+  const firstPointFromTitle = getPointIdFromShippingTitle(firstTitle, {
+    source: "first-shippingTitle",
+  });
 
-  const recurringPointId = recurringPointFromAttrs ?? recurringPointFromCode;
-  const firstPointId = firstPointFromAttrs ?? firstPointFromCode;
+  const recurringPointId =
+    recurringPointFromAttrs ?? recurringPointFromCode ?? recurringPointFromTitle;
+  const firstPointId = firstPointFromAttrs ?? firstPointFromCode ?? firstPointFromTitle;
 
   const isPointIdMatch =
     Boolean(recurringPointId) &&
@@ -458,9 +536,23 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     Boolean(recurringCode) && Boolean(firstCode) && recurringCode === firstCode;
 
   const isDeliveryMatching = isPointIdMatch || isExactSameCode || isExactSameTitle;
-  const currentAttributes = normalizeCustomAttributes(currentOrder.customAttributes);
-  const preferredAttributes = normalizeCustomAttributes(
-    firstTaggedOrder.customAttributes,
+  const currentAttributes = enrichPickupPointAttributes(
+    normalizeCustomAttributes(currentOrder.customAttributes),
+    {
+      pointId: recurringPointId,
+      courier: currentOrder.shippingLine?.title?.toLowerCase().includes("inpost")
+        ? "InPost Paczkomaty"
+        : null,
+    },
+  );
+  const preferredAttributes = enrichPickupPointAttributes(
+    normalizeCustomAttributes(firstTaggedOrder.customAttributes),
+    {
+      pointId: firstPointId ?? recurringPointId,
+      courier: firstTaggedOrder.shippingLine?.title?.toLowerCase().includes("inpost")
+        ? "InPost Paczkomaty"
+        : null,
+    },
   );
   const mergedAttributes = mergePickupPointAttributes(
     currentAttributes,
@@ -482,6 +574,7 @@ export const processSubscriptionDeliverySyncWebhook = async ({
       pointId: recurringPointId,
       pointFromAttrs: recurringPointFromAttrs,
       pointFromCode: recurringPointFromCode,
+      pointFromTitle: recurringPointFromTitle,
       customAttributes: currentOrder.customAttributes,
     },
     first: {
@@ -490,6 +583,7 @@ export const processSubscriptionDeliverySyncWebhook = async ({
       pointId: firstPointId,
       pointFromAttrs: firstPointFromAttrs,
       pointFromCode: firstPointFromCode,
+      pointFromTitle: firstPointFromTitle,
       customAttributes: firstTaggedOrder.customAttributes,
     },
     matchChecks: {
