@@ -129,6 +129,42 @@ const getPointIdFromCustomAttributes = (
   return pointIdAttribute.value.trim();
 };
 
+const isPickupDeliveryTitle = (shippingTitle: string | null | undefined): boolean => {
+  if (!shippingTitle?.trim()) {
+    return false;
+  }
+
+  const normalized = shippingTitle.toLowerCase();
+  return normalized.includes("paczkomat") || normalized.includes("pickup");
+};
+
+const isPickupDelivery = ({
+  shippingTitle,
+  shippingCode,
+  pointIdFromAttributes,
+  pointIdFromCode,
+}: {
+  shippingTitle: string | null | undefined;
+  shippingCode: string | null | undefined;
+  pointIdFromAttributes: string | null;
+  pointIdFromCode: string | null;
+}): boolean => {
+  if (pointIdFromAttributes || pointIdFromCode) {
+    return true;
+  }
+
+  if (isPickupDeliveryTitle(shippingTitle)) {
+    return true;
+  }
+
+  // Wiele integracji kurierskich nie ma pointId i nie powinno dostać PickupPoint*.
+  if (!shippingCode && !shippingTitle) {
+    return false;
+  }
+
+  return false;
+};
+
 const normalizeCustomAttributes = (
   customAttributes: Array<{ key: string; value?: string | null }> | undefined,
 ): Array<{ key: string; value: string }> =>
@@ -522,6 +558,24 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     source: "first-shippingTitle",
   });
 
+  const recurringIsPickupDelivery = isPickupDelivery({
+    shippingTitle: recurringTitle,
+    shippingCode: recurringCode,
+    pointIdFromAttributes: recurringPointFromAttrs,
+    pointIdFromCode: recurringPointFromCode,
+  });
+
+  if (!recurringIsPickupDelivery) {
+    appLog.info("sync:skip — bieżące zamówienie nie jest paczkomatem", {
+      ...baseContext,
+      reason: "NON_PICKUP_DELIVERY_SKIPPED",
+      orderId,
+      recurringShippingLine: currentOrder.shippingLine,
+      hint: "Dla metod kurierskich (np. Kurier InPost) nie dopisujemy PickupPoint*.",
+    });
+    return;
+  }
+
   const recurringPointId =
     recurringPointFromAttrs ?? recurringPointFromCode ?? recurringPointFromTitle;
   const firstPointId = firstPointFromAttrs ?? firstPointFromCode ?? firstPointFromTitle;
@@ -540,7 +594,7 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     normalizeCustomAttributes(currentOrder.customAttributes),
     {
       pointId: recurringPointId,
-      courier: currentOrder.shippingLine?.title?.toLowerCase().includes("inpost")
+      courier: isPickupDeliveryTitle(currentOrder.shippingLine?.title)
         ? "InPost Paczkomaty"
         : null,
     },
@@ -549,7 +603,7 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     normalizeCustomAttributes(firstTaggedOrder.customAttributes),
     {
       pointId: firstPointId ?? recurringPointId,
-      courier: firstTaggedOrder.shippingLine?.title?.toLowerCase().includes("inpost")
+      courier: isPickupDeliveryTitle(firstTaggedOrder.shippingLine?.title)
         ? "InPost Paczkomaty"
         : null,
     },
