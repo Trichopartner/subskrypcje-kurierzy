@@ -458,6 +458,18 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     Boolean(recurringCode) && Boolean(firstCode) && recurringCode === firstCode;
 
   const isDeliveryMatching = isPointIdMatch || isExactSameCode || isExactSameTitle;
+  const currentAttributes = normalizeCustomAttributes(currentOrder.customAttributes);
+  const preferredAttributes = normalizeCustomAttributes(
+    firstTaggedOrder.customAttributes,
+  );
+  const mergedAttributes = mergePickupPointAttributes(
+    currentAttributes,
+    preferredAttributes,
+  );
+  const hasAttributeChanges = !areAttributesEquivalent(
+    currentAttributes,
+    mergedAttributes,
+  );
 
   appLog.info("sync:delivery-comparison", {
     ...baseContext,
@@ -491,13 +503,25 @@ export const processSubscriptionDeliverySyncWebhook = async ({
       : "Wykryto rozjazd — przejdę do synchronizacji atrybutów.",
   });
 
-  if (isDeliveryMatching) {
-    appLog.info("sync:done — dostawa już zgodna, bez zmian", {
+  if (isDeliveryMatching && !hasAttributeChanges) {
+    appLog.info("sync:done — dostawa zgodna i atrybuty kompletne, bez zmian", {
       ...baseContext,
-      reason: "DELIVERY_ALREADY_MATCHING",
+      reason: "DELIVERY_AND_ATTRIBUTES_ALREADY_MATCHING",
       orderId,
     });
     return;
+  }
+
+  if (isDeliveryMatching && hasAttributeChanges) {
+    appLog.info(
+      "sync:delivery-ok-but-attributes-missing — wymuszam uzupełnienie danych PickupPoint*",
+      {
+        ...baseContext,
+        reason: "DELIVERY_MATCHING_BUT_ATTRIBUTES_NEED_SYNC",
+        orderId,
+        attributeDiff: diffAttributes(currentAttributes, mergedAttributes),
+      },
+    );
   }
 
   appLog.warn("sync:mismatch — rozjazd dostawy vs pierwsze zamówienie", {
@@ -509,20 +533,6 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     limitation:
       "Aplikacja nie zmienia shippingLine w zamówieniu — tylko customAttributes + notatkę.",
   });
-
-  const currentAttributes = normalizeCustomAttributes(currentOrder.customAttributes);
-  const preferredAttributes = normalizeCustomAttributes(
-    firstTaggedOrder.customAttributes,
-  );
-  const mergedAttributes = mergePickupPointAttributes(
-    currentAttributes,
-    preferredAttributes,
-  );
-
-  const hasAttributeChanges = !areAttributesEquivalent(
-    currentAttributes,
-    mergedAttributes,
-  );
 
   appLog.info("sync:attributes-merge", {
     ...baseContext,
