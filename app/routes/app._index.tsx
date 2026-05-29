@@ -24,20 +24,31 @@ export default function Index() {
 
       <s-section heading="Jak to działa">
         <s-paragraph>
-          1. Po utworzeniu zamówienia aplikacja wykrywa, czy dotyczy ono
-          subskrypcji.
+          1. Webhook Shopify (orders/create, orders/update) synchronizuje
+          zamówienia subskrypcyjne Appstle w Shopify.
         </s-paragraph>
         <s-paragraph>
-          2. Jeśli to kolejne zamówienie w kontrakcie, aplikacja pobiera metodę
-          dostawy z pierwszego zamówienia.
+          2. Webhook Sellassist koryguje mapowanie subscription → kurier lub
+          paczkomat na podstawie danych z Shopify.
         </s-paragraph>
         <s-paragraph>
-          3. Następnie aktualizuje kontrakt subskrypcyjny tak, aby kolejne
-          wysyłki używały tej samej metody.
+          3. Dla paczkomatu uzupełniane są PickupPoint*; dla kuriera usuwane są
+          błędne PickupPoint* i ustawiana właściwa metoda w Sellassist.
+        </s-paragraph>
+      </s-section>
+
+      <s-section heading="Konfiguracja webhooka Sellassist">
+        <s-paragraph>
+          W Sellassist: Administracja → Automatyzacja → Akcje dla zamówień →
+          Wywołaj URL (POST lub GET):
         </s-paragraph>
         <s-paragraph>
-          To eliminuje problem nadpisywania punktu InPost przez domyślną
-          najtańszą metodę.
+          {"{SHOPIFY_APP_URL}"}/webhooks/sellassist/{"{id_order}"}
+        </s-paragraph>
+        <s-paragraph>
+          Zmienne środowiskowe: SELASSIST_ACCOUNT, SELASSIST_API_KEY,
+          SHOPIFY_SHOP_DOMAIN, opcjonalnie SELASSIST_WEBHOOK_SECRET,
+          SELASSIST_SHIPMENT_ID_KURIER, SELASSIST_SHIPMENT_ID_PACZKOMAT.
         </s-paragraph>
       </s-section>
     </s-page>
