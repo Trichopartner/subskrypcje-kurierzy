@@ -1,3 +1,5 @@
+import { appLog } from "../utils/appLogger.server";
+
 export type DeliveryType = "pickup" | "courier" | "unknown";
 
 const PICKUP_POINT_CODE_PATTERN = /\b([A-Z0-9]{5,})\b/g;
@@ -72,23 +74,50 @@ export const getPointIdFromShippingTitle = (
 export const resolveDeliveryType = ({
   shippingTitle,
   shippingCode,
+  logContext,
 }: {
   shippingTitle: string | null | undefined;
   shippingCode: string | null | undefined;
+  logContext?: { runId?: string; source?: string };
 }): DeliveryType => {
-  if (isCourierDeliveryTitle(shippingTitle) || isCourierShippingCode(shippingCode)) {
-    return "courier";
+  const courierByTitle = isCourierDeliveryTitle(shippingTitle);
+  const courierByCode = isCourierShippingCode(shippingCode);
+  const pickupByTitle = isPickupDeliveryTitle(shippingTitle);
+  const pointIdFromCode = getPointIdFromShippingCode(shippingCode);
+  const pointIdFromTitle = getPointIdFromShippingTitle(shippingTitle);
+
+  let result: DeliveryType = "unknown";
+  let reason = "no-match";
+
+  if (courierByTitle || courierByCode) {
+    result = "courier";
+    reason = courierByTitle ? "courier-title" : "courier-code";
+  } else if (pickupByTitle) {
+    result = "pickup";
+    reason = "pickup-title";
+  } else if (pointIdFromCode) {
+    result = "pickup";
+    reason = "pickup-code-pointId";
   }
 
-  if (isPickupDeliveryTitle(shippingTitle)) {
-    return "pickup";
+  if (logContext) {
+    appLog.debug("delivery:resolve-type", {
+      ...logContext,
+      shippingTitle: shippingTitle ?? null,
+      shippingCodePreview: shippingCode?.slice(0, 200) ?? null,
+      checks: {
+        courierByTitle,
+        courierByCode,
+        pickupByTitle,
+        pointIdFromCode,
+        pointIdFromTitle,
+      },
+      result,
+      reason,
+    });
   }
 
-  if (getPointIdFromShippingCode(shippingCode)) {
-    return "pickup";
-  }
-
-  return "unknown";
+  return result;
 };
 
 const PACZKOMAT_POINT_ID_PATTERN = /^[A-Z0-9]{5,}$/i;

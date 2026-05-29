@@ -92,10 +92,15 @@ export const handleOrderWebhook = async (
       });
     }
 
+    const orderId = (payload as { id?: number }).id ?? null;
+    const orderName = (payload as { name?: string }).name ?? null;
+
     appLog.info(`${logPrefix}:finished`, {
       runId,
       topic,
       shop,
+      orderId,
+      orderName,
       totalDurationMs: Date.now() - startedAt,
     });
 

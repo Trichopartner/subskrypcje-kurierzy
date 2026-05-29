@@ -25,23 +25,63 @@ const getSellassistConfig = (): { baseUrl: string; apiKey: string } => {
   };
 };
 
+const previewBody = (body: unknown, maxLen = 500): unknown => {
+  if (body == null) {
+    return null;
+  }
+  if (typeof body === "string") {
+    return body.length > maxLen ? `${body.slice(0, maxLen)}…` : body;
+  }
+  try {
+    const json = JSON.stringify(body);
+    return json.length > maxLen ? `${json.slice(0, maxLen)}…` : body;
+  } catch {
+    return String(body).slice(0, maxLen);
+  }
+};
+
 const sellassistRequest = async <T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> => {
   const { baseUrl, apiKey } = getSellassistConfig();
   const url = `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+  const method = (init?.method ?? "GET").toUpperCase();
+  const startedAt = Date.now();
 
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      apikey: apiKey,
-      "X-Api-Key": apiKey,
-      ...(init?.headers ?? {}),
-    },
+  appLog.info("sellassist:api-request", {
+    method,
+    path,
+    urlHost: new URL(url).host,
+    hasBody: Boolean(init?.body),
+    bodyPreview:
+      typeof init?.body === "string" ? previewBody(init.body, 300) : null,
   });
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        apikey: apiKey,
+        "X-Api-Key": apiKey,
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    appLog.error("sellassist:api-network-error", {
+      path,
+      method,
+      durationMs: Date.now() - startedAt,
+      error:
+        error instanceof Error
+          ? { message: error.message, stack: error.stack }
+          : error,
+    });
+    throw error;
+  }
 
   const text = await response.text();
   let body: unknown = null;
@@ -53,14 +93,28 @@ const sellassistRequest = async <T>(
     }
   }
 
+  const durationMs = Date.now() - startedAt;
+
   if (!response.ok) {
     appLog.error("sellassist:api-error", {
       path,
+      method,
       status: response.status,
-      body,
+      durationMs,
+      responsePreview: previewBody(body),
+      responseLength: text.length,
     });
     throw new Error(`Sellassist API ${response.status} for ${path}`);
   }
+
+  appLog.info("sellassist:api-success", {
+    path,
+    method,
+    status: response.status,
+    durationMs,
+    responsePreview: previewBody(body),
+    responseLength: text.length,
+  });
 
   return body as T;
 };

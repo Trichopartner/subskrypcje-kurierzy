@@ -143,26 +143,39 @@ const isPickupDelivery = ({
   shippingCode,
   pointIdFromAttributes,
   pointIdFromCode,
+  logContext,
 }: {
   shippingTitle: string | null | undefined;
   shippingCode: string | null | undefined;
   pointIdFromAttributes: string | null;
   pointIdFromCode: string | null;
+  logContext?: AppLogContext;
 }): boolean => {
+  let result = false;
+  let reason = "not-pickup";
+
   if (pointIdFromAttributes || pointIdFromCode) {
-    return true;
+    result = true;
+    reason = pointIdFromAttributes ? "pointId-in-attributes" : "pointId-in-code";
+  } else if (isPickupDeliveryTitle(shippingTitle)) {
+    result = true;
+    reason = "pickup-title";
+  } else if (!shippingCode && !shippingTitle) {
+    result = false;
+    reason = "no-shipping-data";
   }
 
-  if (isPickupDeliveryTitle(shippingTitle)) {
-    return true;
-  }
+  appLog.debug("sync:isPickupDelivery", {
+    ...logContext,
+    shippingTitle: shippingTitle ?? null,
+    shippingCodePreview: shippingCode?.slice(0, 200) ?? null,
+    pointIdFromAttributes,
+    pointIdFromCode,
+    result,
+    reason,
+  });
 
-  // Wiele integracji kurierskich nie ma pointId i nie powinno dostać PickupPoint*.
-  if (!shippingCode && !shippingTitle) {
-    return false;
-  }
-
-  return false;
+  return result;
 };
 
 const normalizeCustomAttributes = (
@@ -563,6 +576,18 @@ export const processSubscriptionDeliverySyncWebhook = async ({
     shippingCode: recurringCode,
     pointIdFromAttributes: recurringPointFromAttrs,
     pointIdFromCode: recurringPointFromCode,
+    logContext: { ...baseContext, orderId, side: "recurring" },
+  });
+
+  appLog.info("sync:pickup-detection-first-order", {
+    ...baseContext,
+    orderId,
+    firstIsPickupByTitle: isPickupDeliveryTitle(firstTitle),
+    firstPointId,
+    firstPointFromAttrs,
+    firstPointFromCode,
+    firstPointFromTitle,
+    firstShippingLine: firstTaggedOrder.shippingLine,
   });
 
   if (!recurringIsPickupDelivery) {
